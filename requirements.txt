@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+# Pinned so the container resolves the same Pydantic major/minor that the
+# tests were run against.
+pydantic==2.14.4
