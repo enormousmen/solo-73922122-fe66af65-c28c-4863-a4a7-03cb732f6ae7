@@ -6,3 +6,5 @@ data/
 *.db-wal
 *.db-shm
 demo/work/
+# Local content-store runs (container deployments use the /data volume).
+blobs/

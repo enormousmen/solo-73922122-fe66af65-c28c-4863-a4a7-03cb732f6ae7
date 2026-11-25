@@ -4,10 +4,15 @@
 #   ./demo/demo.sh                      # against http://127.0.0.1:8000
 #   BASE_URL=http://host:8000 ./demo/demo.sh
 #
+# For the on-call scenario (withdrawing a package while its large re-upload
+# is still writing), run instead:
+#   python3 demo/concurrent_withdraw_demo.py
+#
 # Start the service first, either with:
 #   docker compose up --build -d
 # or locally:
-#   MIRROR_DB_PATH=./data/mirror.db uvicorn app.main:app --port 8000
+#   MIRROR_DB_PATH=./data/mirror.db MIRROR_BLOB_DIR=./data/blobs \
+#     uvicorn app.main:app --port 8000
 #
 # The script is read-only with respect to the repository; its working files
 # live in demo/work (git-ignored).

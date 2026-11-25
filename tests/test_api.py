@@ -1,5 +1,6 @@
 import json
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("MIRROR_DB_PATH", str(tmp_path / "mirror.db"))
+    monkeypatch.setenv("MIRROR_BLOB_DIR", str(tmp_path / "blobs"))
     # The application reads MIRROR_DB_PATH at import time.
     for name in list(sys.modules):
         if name == "app" or name.startswith("app."):
@@ -22,22 +24,49 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+def _multipart(parts):
+    """Build a multipart/form-data body from ordered parts.
+
+    Each part is (name, filename, content_type, data).  The manifest must be
+    first, matching the streaming parser's expectations.
+    """
+
+    boundary = f"----mirror-test-{uuid.uuid4().hex}"
+    body = bytearray()
+    for name, filename, content_type, data in parts:
+        body.extend(f"--{boundary}\r\n".encode())
+        if filename is None:
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        else:
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                .encode()
+            )
+            body.extend(f"Content-Type: {content_type or 'application/octet-stream'}\r\n\r\n".encode())
+        body.extend(data)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    return bytes(body), {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+
 def send(client, events):
-    """Send events as multipart form data with manifest + binary fields."""
+    """Send events as streaming multipart: manifest first, then file fields."""
+
     manifest = []
-    files = {}
+    parts = []
     for index, event in enumerate(events):
         item = {k: v for k, v in event.items() if k != "body"}
         if "body" in event:
             field = f"f{index}"
             item["file"] = field
-            files[field] = (item["path"].rsplit("/", 1)[-1], event["body"])
         manifest.append(item)
-    # Passing "files" (even with only the manifest field) forces a multipart
-    # body, which is what the endpoint expects for every batch.
-    files["manifest"] = (None, json.dumps(manifest))
-    response = client.post("/events", files=files)
-    return response
+    parts.append(("manifest", None, None, json.dumps(manifest).encode()))
+    for index, event in enumerate(events):
+        if "body" in event:
+            filename = event["path"].rsplit("/", 1)[-1]
+            parts.append((f"f{index}", filename, None, event["body"]))
+    data, headers = _multipart(parts)
+    return client.post("/events", content=data, headers=headers)
 
 
 def publish(seq, path, body=b"x"):
@@ -46,6 +75,11 @@ def publish(seq, path, body=b"x"):
 
 def delete(seq, path):
     return {"seq": seq, "path": path, "operation": "delete"}
+
+
+def send_raw_manifest(client, manifest_json: bytes):
+    data, headers = _multipart([("manifest", None, None, manifest_json)])
+    return client.post("/events", content=data, headers=headers)
 
 
 def test_publish_then_download(client):
@@ -195,26 +229,16 @@ def test_gc_failure_after_deletes_rolls_back(client, monkeypatch):
 
 def test_validate_bad_manifest(client):
     assert client.post("/events", json={"events": []}).status_code == 415
-    r = client.post("/events", files={"manifest": (None, "not json")})
+    r = send_raw_manifest(client, b"not json")
     assert r.status_code == 422
-    r = client.post(
-        "/events",
-        files={
-            "manifest": (
-                None,
-                json.dumps([{"seq": 1, "path": "a", "operation": "publish"}]),
-            )
-        },
+    r = send_raw_manifest(
+        client,
+        json.dumps([{"seq": 1, "path": "a", "operation": "publish"}]).encode(),
     )
     assert r.status_code == 422
-    r = client.post(
-        "/events",
-        files={
-            "manifest": (
-                None,
-                json.dumps([{"seq": 0, "path": "a", "operation": "delete"}]),
-            )
-        },
+    r = send_raw_manifest(
+        client,
+        json.dumps([{"seq": 0, "path": "a", "operation": "delete"}]).encode(),
     )
     assert r.status_code == 422
 

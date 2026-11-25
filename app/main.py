@@ -9,6 +9,16 @@ Garbage collection is driven by an operator: it reclaims at most ``limit``
 contiguous receipt records after the last saved progress point and stops at
 the first gap.  Receipts and effective deletion tombstones are reclaimed
 together with the progress update, atomically.
+
+Concurrency model
+-----------------
+Artifact bodies are streamed from the request socket straight into a staging
+directory on the filesystem.  No SQLite lock is taken while bodies are being
+received, so a slow or paused large-package upload never blocks a higher
+sequence withdrawal (delete), another ingest, or a GC run.  Only once every
+body of the batch is fully on disk does a short ``BEGIN IMMEDIATE``
+transaction adopt the staged blobs and write the metadata: receipts, package
+state and downloadable content become visible together, or not at all.
 """
 
 from __future__ import annotations
@@ -18,18 +28,33 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from . import db
+from .storage import (
+    ContentStore,
+    MalformedMultipart,
+    PayloadTooLarge,
+    StreamingMultipart,
+)
 
 logger = logging.getLogger("artifact_mirror")
+if not logger.handlers:
+    logging.basicConfig(
+        level=os.environ.get("MIRROR_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 DB_PATH = os.environ.get("MIRROR_DB_PATH", "data/mirror.db")
+BLOB_DIR = os.environ.get(
+    "MIRROR_BLOB_DIR", str(Path(DB_PATH).parent / "blobs")
+)
 MAX_BATCH = 500
 MAX_PATH_LENGTH = 1024
 MAX_LIMIT = 1000
@@ -61,6 +86,19 @@ def _safe_filename(path: str) -> str:
                    for ch in name)
 
 
+def _multipart_boundary(content_type: str) -> bytes:
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            if boundary:
+                return boundary.encode("latin-1")
+    raise HTTPException(
+        status_code=415,
+        detail="expected multipart/form-data with a boundary parameter",
+    )
+
+
 class EventIn(BaseModel):
     seq: int = Field(ge=1, le=2**63 - 1)
     path: str
@@ -86,13 +124,31 @@ class GcRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db.init_db(DB_PATH)
+    store = ContentStore(BLOB_DIR)
+    # Existing databases are migrated in place; existing blob directories are
+    # left untouched apart from the two cleanups below.
+    await run_in_threadpool(db.init_db, DB_PATH, store)
+
+    # A staged file can only belong to an interrupted process: committed rows
+    # reference adopted blobs, never staging paths.
+    stale = await run_in_threadpool(store.cleanup_staging)
+    if stale:
+        logger.info("removed %d staging files left by an earlier run", len(stale))
+
+    # Blobs that no committed row references anymore (e.g. a crash between
+    # adoption and commit, or an old revision replaced before restart).
+    refs = await run_in_threadpool(db.active_content_refs, DB_PATH)
+    orphans = await run_in_threadpool(store.sweep_orphans, refs)
+    if orphans:
+        logger.info("reclaimed %d unreferenced content blobs", len(orphans))
+
+    app.state.store = store
     yield
 
 
 app = FastAPI(
     title="Artifact Mirror",
-    version="1.0.0",
+    version="1.1.0",
     description="Read-only artifact mirror fed by numbered publish/delete events.",
     lifespan=lifespan,
 )
@@ -163,18 +219,21 @@ def _parse_manifest(raw: str) -> list[ManifestEntry]:
 async def ingest_events(request: Request) -> dict[str, Any]:
     """Ingest a batch of numbered operations.
 
-    The request is ``multipart/form-data`` with one field:
+    The request is ``multipart/form-data`` with the ``manifest`` field first
+    (a JSON array) followed by one binary field per publish, named by the
+    manifest's ``file`` entry::
 
-    * ``manifest`` -- JSON array of
-      ``{"seq": 1, "path": "a/b.tgz", "operation": "publish", "file": "f0"}``.
-      ``file`` names another multipart field containing the artifact bytes and
-      is required for ``publish``; ``delete`` events carry no file.
+        manifest=[{"seq": 1, "path": "a/b.tgz", "operation": "publish",
+                   "file": "f0"}]
+        f0=<artifact bytes>
 
-    Events may arrive in any order and may be resent verbatim.  Receipts are
-    recorded even when superseded; only a newer operation changes the
-    download state.  Sequence numbers already reclaimed by GC are acknowledged
-    without being applied, which prevents a late resend from resurrecting a
-    withdrawn package after a restart.
+    The request is parsed in a streaming fashion: each binary field is written
+    straight into the staging directory while the bytes arrive.  No SQLite
+    lock is held during that phase, so a paused large upload does not block
+    deletes, other ingests or GC.  After all bodies are staged, one short
+    transaction adopts the blobs and records the receipts, making the whole
+    batch (receipts, package state and downloadable bodies) effective
+    atomically.  Any staging or commit failure discards the batch completely.
     """
 
     content_type = request.headers.get("content-type", "")
@@ -183,73 +242,137 @@ async def ingest_events(request: Request) -> dict[str, Any]:
             status_code=415,
             detail="expected multipart/form-data with a 'manifest' field",
         )
+    boundary = _multipart_boundary(content_type)
 
-    form = await request.form()
-    raw_manifest = form.get("manifest")
-    if not isinstance(raw_manifest, str):
-        raise HTTPException(status_code=422, detail="missing 'manifest' field")
-    entries = _parse_manifest(raw_manifest)
+    store: ContentStore = request.app.state.store
+    staged: list[Any] = []
+    # Field name -> manifest index expecting that file.
+    expected_files: dict[str, int] = {}
+    entries: list[ManifestEntry] = []
+    prepared: list[dict[str, Any] | None] = []
 
-    seen: set[int] = set()
-    prepared: list[dict[str, Any]] = []
-    batch_bytes = 0
-    for entry in entries:
-        event = entry.event
-        if event.seq in seen:
-            raise HTTPException(
-                status_code=422,
-                detail=f"sequence {event.seq} appears more than once in the batch",
-            )
-        seen.add(event.seq)
+    try:
+        parser = StreamingMultipart(request.stream(), boundary)
+        manifest_seen = False
+        while True:
+            try:
+                part = await parser.next_part()
+            except MalformedMultipart as exc:
+                raise HTTPException(status_code=422, detail=f"malformed multipart body: {exc}")
+            if part is None:
+                break
 
-        record: dict[str, Any] = {
-            "seq": event.seq,
-            "path": event.path,
-            "operation": event.operation,
-        }
-        if event.operation == "publish":
-            upload = form.get(entry.file) if entry.file else None
-            if upload is None or isinstance(upload, str):
+            if part.name == "manifest":
+                if manifest_seen:
+                    raise HTTPException(status_code=422, detail="duplicate 'manifest' field")
+                try:
+                    raw_manifest = await part.read_all(
+                        4 * 1024 * 1024
+                    )
+                except PayloadTooLarge:
+                    raise HTTPException(status_code=413, detail="manifest field too large")
+                entries = _parse_manifest(raw_manifest.decode("utf-8"))
+                prepared = [None] * len(entries)
+                for index, entry in enumerate(entries):
+                    if entry.event.operation == "publish":
+                        if not entry.file:
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"event {entry.event.seq}: publish requires a file field",
+                            )
+                        if entry.file in expected_files:
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"file field {entry.file!r} is referenced more than once",
+                            )
+                        expected_files[entry.file] = index
+                manifest_seen = True
+                continue
+
+            if not manifest_seen:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"event {event.seq}: publish requires a file field",
+                    detail="the 'manifest' field must precede every file field",
                 )
-            # Read with a hard ceiling so a mis-sized upload cannot exhaust
-            # memory before we notice it is too large.
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = await upload.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_ARTIFACT_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"event {event.seq}: artifact exceeds "
-                            f"{MAX_ARTIFACT_BYTES} bytes"
-                        ),
-                    )
-                chunks.append(chunk)
-            batch_bytes += total
-            if batch_bytes > MAX_BATCH_BYTES:
+            if part.filename is None:
+                # Non-file fields other than manifest are not part of the API.
+                raise HTTPException(
+                    status_code=422, detail=f"unexpected form field {part.name!r}"
+                )
+            index = expected_files.pop(part.name, None)
+            if index is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"file field {part.name!r} is not referenced by the manifest",
+                )
+            entry = entries[index]
+            try:
+                body = await store.stream_part_to_staging(part, MAX_ARTIFACT_BYTES)
+            except PayloadTooLarge:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"batch exceeds {MAX_BATCH_BYTES} bytes in total",
+                    detail=(
+                        f"event {entry.event.seq}: artifact exceeds "
+                        f"{MAX_ARTIFACT_BYTES} bytes"
+                    ),
                 )
-            record["content_bytes"] = b"".join(chunks)
-            record["media_type"] = (
-                event.media_type
-                or upload.content_type
-                or "application/octet-stream"
-            )
-        prepared.append(record)
+            if entry.event.media_type:
+                body.media_type = entry.event.media_type
+            staged.append(body)
+            prepared[index] = {
+                "seq": entry.event.seq,
+                "path": entry.event.path,
+                "operation": entry.event.operation,
+                "staging_path": body.staging_path,
+                "sha256": body.sha256,
+                "size": body.size,
+                "media_type": body.media_type,
+            }
 
-    # SQLite calls are blocking; keep the event loop free while the write
-    # transaction runs.
-    results, watermark = await run_in_threadpool(db.ingest_events, DB_PATH, prepared)
-    return {"results": results, "watermark": watermark, "acknowledged": True}
+        if not manifest_seen:
+            raise HTTPException(status_code=422, detail="missing 'manifest' field")
+        if expected_files:
+            missing = ", ".join(sorted(expected_files))
+            raise HTTPException(status_code=422, detail=f"missing file field(s): {missing}")
+
+        # Delete events need no staging slot; fill them in now, preserving
+        # manifest order so the receipt results line up with the request.
+        for index, entry in enumerate(entries):
+            if prepared[index] is None:
+                prepared[index] = {
+                    "seq": entry.event.seq,
+                    "path": entry.event.path,
+                    "operation": entry.event.operation,
+                }
+
+        batch_bytes = sum(item.get("size", 0) for item in prepared)
+        if batch_bytes > MAX_BATCH_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"batch exceeds {MAX_BATCH_BYTES} bytes in total",
+            )
+
+        seen: set[int] = set()
+        for item in prepared:
+            if item["seq"] in seen:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"sequence {item['seq']} appears more than once in the batch",
+                )
+            seen.add(item["seq"])
+
+        # The write phase: short metadata-only transaction.  SQLite blocking
+        # calls run in a worker thread; staging cleanup is handled inside.
+        results, watermark = await run_in_threadpool(
+            db.ingest_events, DB_PATH, prepared, store
+        )
+        return {"results": results, "watermark": watermark, "acknowledged": True}
+    except Exception:
+        # Any failure before a successful commit leaves nothing behind: the
+        # database is untouched and every staged body is removed.
+        for body in staged:
+            store.discard(body.staging_path)
+        raise
 
 
 @app.get("/artifacts")
@@ -261,7 +384,7 @@ async def list_artifacts(include_deleted: bool = False) -> dict[str, Any]:
 
 
 @app.get("/artifacts/{path:path}")
-async def download(path: str) -> Response:
+async def download(path: str, request: Request):
     try:
         path = _validate_path(path)
     except ValueError as exc:
@@ -271,14 +394,31 @@ async def download(path: str) -> Response:
         raise HTTPException(status_code=404, detail="artifact not found")
     if row["operation"] == "delete":
         raise HTTPException(status_code=404, detail="artifact was deleted")
+
+    headers = {
+        "ETag": f'"{row["sha256"]}"',
+        "X-Sequence": str(row["latest_seq"]),
+        "Content-Disposition": f'inline; filename="{_safe_filename(path)}"',
+    }
+    store: ContentStore = request.app.state.store
+    if row["content_ref"] is not None:
+        blob_path = store.blob_path(row["content_ref"])
+        if not blob_path.is_file():
+            # A referenced blob should always exist; this signals disk damage.
+            logger.error("missing blob %s for path %s", row["content_ref"], path)
+            raise HTTPException(status_code=503, detail="stored body is unavailable")
+        # FileResponse streams from disk instead of loading the body into RAM.
+        return FileResponse(
+            path=str(blob_path),
+            media_type=row["media_type"] or "application/octet-stream",
+            headers=headers,
+        )
+    # Legacy databases whose BLOB migration has not run yet.
+    legacy = bytes(row["content"] or b"")
     return Response(
-        content=bytes(row["content"] or b""),
+        content=legacy,
         media_type=row["media_type"] or "application/octet-stream",
-        headers={
-            "ETag": f'"{row["sha256"]}"',
-            "X-Sequence": str(row["latest_seq"]),
-            "Content-Disposition": f'inline; filename="{_safe_filename(path)}"',
-        },
+        headers=headers,
     )
 
 
@@ -297,7 +437,8 @@ async def run_gc(payload: GcRequest) -> dict[str, Any]:
 
     Progress resumes from the saved watermark and stops at the first missing
     sequence number.  All changes are in one transaction: on failure nothing is
-    reclaimed and the watermark does not move.
+    reclaimed and the watermark does not move.  GC touches metadata only, so it
+    completes even while large uploads are still streaming into staging.
     """
 
     return await run_in_threadpool(db.run_gc, DB_PATH, payload.limit)

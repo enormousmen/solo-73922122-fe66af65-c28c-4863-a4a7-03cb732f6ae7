@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MIRROR_DB_PATH=/data/mirror.db
+    MIRROR_DB_PATH=/data/mirror.db \
+    MIRROR_BLOB_DIR=/data/blobs
 
 WORKDIR /app
 

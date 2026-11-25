@@ -1,12 +1,15 @@
 services:
   mirror:
     build: .
-    image: artifact-mirror:1.0.0
+    image: artifact-mirror:1.1.0
     container_name: artifact-mirror
     ports:
       - "8000:8000"
     environment:
       MIRROR_DB_PATH: /data/mirror.db
+      # Artifact bodies live here as content-addressed blobs; staging
+      # uploads go to /data/blobs/.staging and are cleaned on startup.
+      MIRROR_BLOB_DIR: /data/blobs
     volumes:
       - mirror-data:/data
     restart: unless-stopped
